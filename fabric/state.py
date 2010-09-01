@@ -63,6 +63,88 @@ class _AttributeDict(dict):
             if value:
                 return value
 
+class CircularReference(KeyError):
+    """
+    Exception for circular references. Each time it is raised, it
+    adds the current key to the cycle list and outputs the list in
+    the end.
+
+    The ``cycle`` property gives you they keys involved in the
+    cycle, from shallow to deep.
+    """
+    def __init__(self, key, previous=None, **kwargs):
+        if previous:
+            self.cycle = [key] + previous.cycle
+        else:
+            self.cycle = [key]
+        super(CircularReference, self).__init__(str(self), **kwargs)
+    def __str__(self):
+        return ' -> '.join(self.cycle)
+
+import string
+class _RecursiveAttributeDict(_AttributeDict):
+    """
+    Whenever an attribute is accessed, this dictionary evaluates
+    any PEP 3101 style format strings it finds. It does this
+    recursively so your env can have complex interdependencies.
+
+    For example::
+
+        >>> env = _RecursiveAttributeDict()
+        >>> env.one = 'one depends on two, {two}'
+        >>> env.two = 'two stands alone'
+        >>> env.one
+        'one depends on two, two stands alone'
+
+    Circular references will trigger an exception that lists the
+    cycle::
+
+        >>> env = _RecursiveAttributeDict()
+        >>> env.foo = 'foo depends on {bar}'
+        >>> env.bar = 'but bar depends on {foo}, oh noes!'
+        >>> env.foo
+        Traceback (most recent call last):
+        ...
+        CircularReference: foo -> bar -> foo
+
+    """
+    def __init__(self, *args, **kwargs):
+        dict.__setattr__(self, '_formatter', string.Formatter())
+        super(_RecursiveAttributeDict, self).__init__(*args, **kwargs)
+
+    def evaluate_item(self, key, keys_so_far=None):
+        """
+        Recursively evaluates a single dictionary item.
+        """
+        if keys_so_far is None:
+            keys_so_far = set()
+
+        if key in keys_so_far:
+            raise CircularReference(key)
+
+        keys_so_far.add(key)
+        raw_value = dict.__getitem__(self, key)
+        if not isinstance(raw_value, basestring):
+            return raw_value
+
+        subkeys = dict(
+            (key,None) for t,key,f,c in
+            self._formatter.parse(raw_value)
+            if key
+        )
+
+        # Recursively evaluate subkeys
+        try:
+            for subkey in subkeys:
+                subkeys[subkey] = self.evaluate_item(subkey, keys_so_far)
+        except CircularReference as e:
+            raise CircularReference(key, e)
+
+        return self._formatter.format(raw_value, **subkeys)
+
+    def __getitem__(self, key):
+        return self.evaluate_item(key)
+    __getattr__ = __getitem__
 
 # By default, if the user (including code using Fabric as a library) doesn't
 # set the username, we obtain the currently running username and use that.
@@ -210,7 +292,7 @@ env_options = [
 # Most default values are specified in `env_options` above, in the interests of
 # preserving DRY: anything in here is generally not settable via the command
 # line.
-env = _AttributeDict({
+env = _RecursiveAttributeDict({
     'all_hosts': None, 
     'command': None,
     'cwd': '', # Must be empty string, not None, for concatenation purposes
